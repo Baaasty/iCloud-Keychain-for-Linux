@@ -152,11 +152,15 @@ icp edit example.com anna --add-site shop.example.com --apply      # saves it
 icp edit example.com anna --password-stdin --apply                 # new password (prompted)
 icp edit example.com anna --stdin-json --apply < changes.json      # {"notes": ..., "totp": ...}
 icp edit example.com anna --site example.org --apply               # new primary website (rekey)
+icp edit example.com anna --delete --apply                         # move to Recently Deleted
 ```
 
 What can be changed: the password, the primary website (`--site`), the username
 (`--new-username`), extra websites (`--add-site` / `--remove-site`), the title, the notes and the
 verification code (`totp`: an `otpauth://totp` URI or a base32 setup key, `""` removes it).
+`--delete` moves the login and its metadata to **Recently Deleted**, like the Passwords app does,
+so it can be recovered on any device. When several logins share website and username (http vs
+https, another port or path), pick one with `--uuid` (the `uuid` the vault stores per login).
 Title, notes, extra websites and codes live in the login's Passwords-app metadata; a login that
 has none yet must be edited once in the Passwords app first. Secrets (password, notes, code) are
 best passed via `--password-stdin` or `--stdin-json`, never as arguments. Logins in shared groups
