@@ -252,6 +252,7 @@ class Changes:
     title: str | None = None
     notes: str | None = None
     totp: str | None = None              # otpauth:// URI or base32 key; "" removes the code
+    trash: bool = False                  # move to Recently Deleted (alone, no other change)
 
     def touches_sidecar(self) -> bool:
         return bool(self.add_sites or self.remove_sites or self.title is not None
@@ -259,7 +260,7 @@ class Changes:
 
     def empty(self) -> bool:
         return not (self.site or self.username is not None or self.password is not None
-                    or self.touches_sidecar())
+                    or self.touches_sidecar() or self.trash)
 
 
 @dataclasses.dataclass
@@ -292,11 +293,38 @@ def _site_host(site: str) -> str:
     return s
 
 
+RECENTLY_DELETED = "-recently-deleted"   # agrp suffix of the Passwords app's Recently Deleted
+
+
+def trash_entry(entry: Entry) -> Edit:
+    """Delete the way the Passwords app does: login and metadata move to their
+    `<agrp>-recently-deleted` access group (a rekey - new records, then the originals are
+    deleted), so the entry can still be recovered from Recently Deleted on any device.
+    Format from Laky-64/appleservices (MIT) ckks/vault.go MoveRecordIn."""
+    if entry.sidecar_count > 1:
+        raise WriteError(f"this login has {entry.sidecar_count} Passwords metadata records - "
+                         "ambiguous, not deleting")
+    stamp = _now()
+    moved = []
+    for item in (entry.login, entry.sidecar):
+        if item is None:
+            moved.append(None)
+            continue
+        copy = {**item, "agrp": str(item.get("agrp") or "") + RECENTLY_DELETED, "mdat": stamp}
+        copy.pop("sha1", None)
+        moved.append(copy)
+    return Edit(moved[0], moved[1], ["moved to Recently Deleted"], rekey=True)
+
+
 def apply_changes(entry: Entry, ch: Changes, others: list | None = None) -> Edit:
     """The edit as new plists plus a diff without secrets. Pure: no network. `others` = all
     logins, for the duplicate check of a rekey."""
     if ch.empty():
         raise WriteError("nothing to change")
+    if ch.trash:
+        if dataclasses.replace(ch, trash=False) != Changes():
+            raise WriteError("delete cannot be combined with other changes")
+        return trash_entry(entry)
     login = dict(entry.login)
     diff: list[str] = []
     old_key = (entry.domain, entry.username)
@@ -628,7 +656,7 @@ def edit(client, domain: str, username: str, changes: Changes, *, apply: bool) -
     login_uuid = next((w[5] for w in writes if w[1] == "login"),
                       entry.login_record.record_name)
     result = {"ok": True, "diff": ed.diff, "saved": [], "backups": [], "dry_run": not apply,
-              "uuid": login_uuid, "rekey": ed.rekey}
+              "uuid": login_uuid, "rekey": ed.rekey, "trashed": changes.trash}
     if not apply:
         return result
 

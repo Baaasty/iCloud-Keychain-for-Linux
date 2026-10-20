@@ -312,6 +312,20 @@ class EditLogicTests(unittest.TestCase):
         with self.assertRaises(write.WriteError):
             write.apply_changes(mine, write.Changes(site="b.org"), [mine, other])
 
+    def test_trash_moves_both_to_recently_deleted(self):
+        ed = write.apply_changes(self._entry(), write.Changes(trash=True))
+        self.assertTrue(ed.rekey)
+        self.assertEqual(ed.login["agrp"], "com.apple.cfnetwork-recently-deleted")
+        self.assertEqual(ed.sidecar["agrp"], "com.apple.password-manager-recently-deleted")
+        self.assertEqual((ed.login["srvr"], ed.login["acct"], ed.login["v_Data"]),
+                         ("example.com", "anna", b"old-pass"))   # nothing else changes
+        self.assertNotIn("sha1", ed.login)
+        self.assertEqual(ed.diff, ["moved to Recently Deleted"])
+
+    def test_trash_alone(self):
+        with self.assertRaises(write.WriteError):
+            write.apply_changes(self._entry(), write.Changes(trash=True, password="x"))
+
     def test_no_op_is_refused(self):
         with self.assertRaises(write.WriteError):
             write.apply_changes(self._entry(), write.Changes(password="old-pass"))
@@ -445,6 +459,17 @@ class EditFlowTests(unittest.TestCase):
         self.assertEqual(res["uuid"], srv.calls[0][1])
         new = pipeline.decrypt_record(srv.store[res["uuid"]], {CLASS_UUID: CLASS_KEY})
         self.assertEqual((new["srvr"], new["UUID"]), ("new.example", res["uuid"]))
+
+    def test_trash_flow(self):
+        srv, p = self._server()
+        with p:
+            res = write.edit(srv, "example.com", "anna", write.Changes(trash=True), apply=True)
+        self.assertEqual([c[0] for c in srv.calls], ["save", "save", "delete", "delete"])
+        self.assertTrue(res["trashed"])
+        agrps = sorted(pipeline.decrypt_record(r, {CLASS_UUID: CLASS_KEY})["agrp"]
+                       for r in srv.store.values())
+        self.assertEqual(agrps, ["com.apple.cfnetwork-recently-deleted",
+                                 "com.apple.password-manager-recently-deleted"])
 
     def test_rekey_bad_read_back_deletes_nothing(self):
         srv, p = self._server(corrupt_reads=True)

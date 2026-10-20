@@ -141,6 +141,7 @@ _AGRP_LOGIN = {"com.apple.cfnetwork", "apple"}
 _AGRP_SIDECAR_PREFIX = "com.apple.password-manager"
 _AGRP_CARD = "com.apple.safari.credit-cards"
 _AGRP_PASSKEY = "com.apple.webkit.webauthn"
+_RECENTLY_DELETED = "-recently-deleted"
 
 _SIDECAR_LABEL_PREFIX = "password manager metadata:"
 # Allowlist: unknown keys are dropped. `s_hi` is excluded deliberately - it holds previous
@@ -210,6 +211,9 @@ def classify_item(item) -> tuple:
     raw = item.get("v_Data") or item.get("password") or b""
     label = str(item.get("labl") or "")
 
+    # the Passwords app's Recently Deleted: `<agrp>-recently-deleted`, never autofilled
+    if agrp.endswith(_RECENTLY_DELETED):
+        return "deleted", None
     if agrp.startswith(_AGRP_SIDECAR_PREFIX):
         payload = classify_payload(raw, label)[1]
         return "sidecar", payload if isinstance(payload, dict) else {}
@@ -314,7 +318,7 @@ class CredentialStore:
             label = str(it.get("labl") or "")
             kind, payload = classify_item(it)
             # The label names the login the sidecar describes, so trust it over an empty payload.
-            if label.lower().startswith(_SIDECAR_LABEL_PREFIX):
+            if kind != "deleted" and label.lower().startswith(_SIDECAR_LABEL_PREFIX):
                 kind, payload = "sidecar", payload if isinstance(payload, dict) else {}
 
             key = (str(domain).lower(), str(username).lower())

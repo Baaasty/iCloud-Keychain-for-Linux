@@ -847,7 +847,7 @@ def cmd_edit(args) -> int:
     from ..transport.cloudkit import CloudKitError
 
     fields = {"site": args.site, "username": args.new_username, "title": args.title,
-              "notes": args.notes, "password": None,
+              "notes": args.notes, "password": None, "trash": args.delete,
               "add_sites": tuple(args.add_site or ()), "remove_sites": tuple(args.remove_site or ())}
     if args.password_stdin:
         fields["password"] = (ui.secret("New password: ") if sys.stdin.isatty()
@@ -866,6 +866,8 @@ def cmd_edit(args) -> int:
         for key in ("add_sites", "remove_sites"):
             if isinstance(data.get(key), list):
                 fields[key] = tuple(str(x) for x in data[key])
+        if data.get("trash") is True:
+            fields["trash"] = True
     changes = write.Changes(**fields)
     lock = None
     try:
@@ -1051,7 +1053,11 @@ def main(argv=None) -> int:
     ep_in.add_argument("--stdin-json", action="store_true",
                        help="read the changes as JSON from stdin: site, username, password, "
                             "title, notes, totp (otpauth:// URI or base32 key, \"\" removes it), "
-                            "add_sites, remove_sites (keeps secrets out of the process list)")
+                            "add_sites, remove_sites, trash (true = --delete) (keeps secrets out "
+                            "of the process list)")
+    ep.add_argument("--delete", action="store_true",
+                    help="move the login to Recently Deleted, like the Passwords app (it can be "
+                         "recovered there); not combinable with other changes")
     ep.add_argument("--title", help="new title (Passwords app name)")
     ep.add_argument("--notes", help="new notes")
     ep.add_argument("--apply", action="store_true", help="really save (default: dry run)")
