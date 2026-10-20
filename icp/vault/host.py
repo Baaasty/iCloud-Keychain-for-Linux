@@ -36,6 +36,7 @@ class Credential:
     totp: str = ""
     group: str = ""  # Empty for the user's keychain.
     sites: tuple = ()  # Extra websites from the Passwords metadata (`s_as`), hosts.
+    uuid: str = ""  # Login UUID (= CloudKit record name); unique, unlike (domain, user).
 
     @property
     def recency(self) -> float:
@@ -45,7 +46,7 @@ class Credential:
         return {"domain": self.domain, "username": self.username,
                 "password": self.password, "title": self.title, "mdat": self.mdat,
                 "notes": self.notes, "last_used": self.last_used, "totp": self.totp,
-                "group": self.group, "sites": list(self.sites)}
+                "group": self.group, "sites": list(self.sites), "uuid": self.uuid}
 
     def wire_dict(self) -> dict:
         """The extension's view: the `totp` URI is replaced by a code generated now."""
@@ -337,14 +338,14 @@ class CredentialStore:
             if (not domain and not username) or not (username or payload):
                 continue
             logins.append((key, str(domain), str(username), payload, title,
-                           _to_unix(it.get("mdat") or it.get("cdat"))))
+                           _to_unix(it.get("mdat") or it.get("cdat")), str(it.get("UUID") or "")))
 
         creds = []
-        for key, domain, username, pw, title, mdat in logins:
+        for key, domain, username, pw, title, mdat, uuid in logins:
             side = sidecars.get(key, {})
             title = _sidecar_text(side.get("title")) or title
             creds.append(Credential(
-                domain=domain, username=username, password=pw, title=title, mdat=mdat,
+                domain=domain, username=username, password=pw, title=title, mdat=mdat, uuid=uuid,
                 notes=_sidecar_text(side.get("notes")),
                 last_used=_sidecar_last_used(side.get("ctxt")),
                 totp=totp_codes.uri_from_sidecar(side.get("totp")),

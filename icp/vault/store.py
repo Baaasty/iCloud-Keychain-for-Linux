@@ -40,6 +40,6 @@ def load_vault() -> CredentialStore:
                         mdat=c.get("mdat", 0.0),
                         notes=c.get("notes", ""), last_used=c.get("last_used", 0.0),
                         totp=c.get("totp", ""), group=c.get("group", ""),
-                        sites=tuple(c.get("sites") or ()))
+                        sites=tuple(c.get("sites") or ()), uuid=c.get("uuid", ""))
              for c in data.get("credentials", [])]
     return CredentialStore(creds)

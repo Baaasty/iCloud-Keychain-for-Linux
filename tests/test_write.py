@@ -402,6 +402,43 @@ class EditFlowTests(unittest.TestCase):
         srv = _FakeServer([_item_record("U-1", login), _item_record("U-2", side)], **kw)
         return srv, mock.patch.object(write, "fetch", srv.fetch)
 
+    def _twins(self):
+        """Two logins with the same website + user (http and https), one shared sidecar."""
+        a = {**_login(), "UUID": "U-1", "ptcl": "htps"}
+        b = {**_login(), "UUID": "U-3", "ptcl": "http", "v_Data": b"other"}
+        side = {**_sidecar(), "UUID": "U-2"}
+        srv = _FakeServer([_item_record("U-1", a), _item_record("U-3", b),
+                           _item_record("U-2", side)])
+        return srv, mock.patch.object(write, "fetch", srv.fetch)
+
+    def test_twins_need_the_uuid(self):
+        srv, p = self._twins()
+        with p, self.assertRaises(write.WriteError):
+            write.edit(srv, "example.com", "anna", write.Changes(password="x"), apply=True)
+        with p:
+            write.edit(srv, "example.com", "anna", write.Changes(password="x"), apply=True,
+                       uuid="U-3")
+        self.assertEqual(srv.calls, [("save", "U-3")])
+
+    def test_trash_twin_keeps_shared_metadata(self):
+        srv, p = self._twins()
+        with p:
+            write.edit(srv, "example.com", "anna", write.Changes(trash=True), apply=True,
+                       uuid="U-3")
+        self.assertEqual([c[0] for c in srv.calls], ["save", "delete"])
+        self.assertEqual(srv.calls[1][1], "U-3")
+        self.assertIn("U-2", srv.store)            # sidecar still describes U-1
+        self.assertIn("U-1", srv.store)
+
+    def test_rekey_twin_copies_metadata_but_keeps_it(self):
+        srv, p = self._twins()
+        with p:
+            write.edit(srv, "example.com", "anna", write.Changes(site="new.example"),
+                       apply=True, uuid="U-3")
+        self.assertEqual([c[0] for c in srv.calls], ["save", "save", "delete"])
+        self.assertEqual(srv.calls[2][1], "U-3")
+        self.assertIn("U-2", srv.store)
+
     def test_update_in_place(self):
         srv, p = self._server()
         with p:

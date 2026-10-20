@@ -131,6 +131,9 @@ class Entry:
     sidecar_record: ckks.CloudKitRecord | None = None
     sidecar: dict | None = None
     sidecar_count: int = 0      # >1: ambiguous metadata, nothing that touches it is allowed
+    # other logins with the same website + username (they differ in protocol, port or path): the
+    # metadata, joined on (website, username), belongs to them too - a rekey or delete leaves it
+    siblings: int = 0
 
     @property
     def domain(self) -> str:
@@ -164,23 +167,35 @@ def find_entries(items_records: list) -> list[Entry]:
             logins.append((key, rec, it))
         elif agrp == AGRP_SIDECAR and str(it.get("labl") or "").startswith(SIDECAR_LABEL):
             sidecars.setdefault(key, []).append((rec, it))
+    per_key = {}
+    for key, _rec, _it in logins:
+        per_key[key] = per_key.get(key, 0) + 1
     out = []
     for key, rec, it in logins:
         side = sidecars.get(key, [])
-        e = Entry(rec, it, sidecar_count=len(side))
+        e = Entry(rec, it, sidecar_count=len(side), siblings=per_key[key] - 1)
         if len(side) == 1:
             e.sidecar_record, e.sidecar = side[0]
         out.append(e)
     return out
 
 
-def select_entry(entries: list[Entry], domain: str, username: str) -> Entry:
+def select_entry(entries: list[Entry], domain: str, username: str,
+                 uuid: str | None = None) -> Entry:
+    """The login to edit. `uuid` (the record name, e.g. from the vault) is exact; website +
+    username alone can match several logins that differ in protocol, port or path."""
+    if uuid:
+        hits = [e for e in entries if e.login_record.record_name == uuid]
+        if not hits:
+            raise WriteError(f"no login with id {uuid} (synced since?)")
+        return hits[0]
     hits = [e for e in entries
             if _norm(e.domain) == _norm(domain) and _norm(e.username) == _norm(username)]
     if not hits:
         raise WriteError(f"no login for {domain} / {username!r}")
     if len(hits) > 1:
-        raise WriteError(f"{len(hits)} logins for {domain} / {username!r} - ambiguous")
+        raise WriteError(f"{len(hits)} logins for {domain} / {username!r} - pass its id "
+                         "(--uuid) to pick one")
     return hits[0]
 
 
@@ -306,7 +321,8 @@ def trash_entry(entry: Entry) -> Edit:
                          "ambiguous, not deleting")
     stamp = _now()
     moved = []
-    for item in (entry.login, entry.sidecar):
+    # metadata shared with a sibling login stays where it is (it still describes that one)
+    for item in (entry.login, None if entry.siblings else entry.sidecar):
         if item is None:
             moved.append(None)
             continue
@@ -619,14 +635,16 @@ def _send(client, state: dict, op: str, what: str, rec, req: bytes, result: dict
     done.append(f"{op} {what}")
 
 
-def edit(client, domain: str, username: str, changes: Changes, *, apply: bool) -> dict:
-    """Edit one login. Dry run (apply=False) does everything up to and including the encryption
-    self-check, but sends nothing. Returns {ok, diff, saved, backups, uuid, rekey, login,
-    sidecar}; `backups` are the record names `restore` accepts."""
+def edit(client, domain: str, username: str, changes: Changes, *, apply: bool,
+         uuid: str | None = None) -> dict:
+    """Edit one login (`uuid` picks it exactly, see select_entry). Dry run (apply=False) does
+    everything up to and including the encryption self-check, but sends nothing. Returns
+    {ok, diff, saved, backups, uuid, rekey, login, sidecar}; `backups` are the record names
+    `restore` accepts."""
     records, tlks = fetch(client)
     keyring = build_keyring(records, tlks)
     entries = find_entries(_decrypted(records, keyring))
-    entry = select_entry(entries, domain, username)
+    entry = select_entry(entries, domain, username, uuid)
     ed = apply_changes(entry, changes, entries)
 
     # (op, what, record, item, request): updates in place, or a rekey = inserts, then deletes
@@ -638,7 +656,7 @@ def edit(client, domain: str, username: str, changes: Changes, *, apply: bool) -
         if ed.sidecar is not None:
             new_side_uuid, req, sidecar = build_insert(entry.sidecar_record, ed.sidecar, keyring)
             writes.append(("insert", "metadata", None, sidecar, req, new_side_uuid))
-        if entry.sidecar_record is not None:
+        if entry.sidecar_record is not None and not entry.siblings:   # else still theirs
             deletes.append(("delete", "old metadata", entry.sidecar_record,
                             ckks.build_delete_request(entry.sidecar_record)))
         deletes.append(("delete", "old login", entry.login_record,
@@ -656,7 +674,8 @@ def edit(client, domain: str, username: str, changes: Changes, *, apply: bool) -
     login_uuid = next((w[5] for w in writes if w[1] == "login"),
                       entry.login_record.record_name)
     result = {"ok": True, "diff": ed.diff, "saved": [], "backups": [], "dry_run": not apply,
-              "uuid": login_uuid, "rekey": ed.rekey, "trashed": changes.trash}
+              "uuid": login_uuid, "old_uuid": entry.login_record.record_name, "rekey": ed.rekey,
+              "trashed": changes.trash}
     if not apply:
         return result
 

@@ -798,17 +798,25 @@ def _write_session(args):
     return lock, client
 
 
-def _patch_vault(domain: str, username: str, login: dict, sidecar: dict | None) -> None:
-    """Swap the edited login into the local vault right away (the next sync would too)."""
+def _patch_vault(domain: str, username: str, login: dict, sidecar: dict | None,
+                 old_uuid: str = "") -> None:
+    """Swap the edited login into the local vault right away (the next sync would too). Matched
+    by its id where the vault has one - website + username can belong to several logins."""
     import dataclasses
     from ..vault import store as vault
     from ..vault.host import CredentialStore
 
+    def edited(c) -> bool:
+        if c.group:
+            return False
+        if old_uuid and c.uuid:
+            return c.uuid == old_uuid
+        return c.domain.lower() == domain.lower() and c.username.lower() == username.lower()
+
     new = CredentialStore.from_items([login] + ([sidecar] if sidecar else [])).all()
     keep, prev = [], None
     for c in vault.load_vault().all():
-        if (c.group == "" and c.domain.lower() == domain.lower()
-                and c.username.lower() == username.lower()):
+        if edited(c):
             prev = prev or c
         else:
             keep.append(c)
@@ -872,10 +880,12 @@ def cmd_edit(args) -> int:
     lock = None
     try:
         lock, client = _write_session(args)
-        result = write.edit(client, args.domain, args.username, changes, apply=args.apply)
+        result = write.edit(client, args.domain, args.username, changes, apply=args.apply,
+                            uuid=args.uuid)
         if args.apply:
             try:
-                _patch_vault(args.domain, args.username, result["login"], result.get("sidecar"))
+                _patch_vault(args.domain, args.username, result["login"], result.get("sidecar"),
+                             result.get("old_uuid", ""))
             except Exception as e:  # noqa: BLE001 - the save itself went through
                 ui.warn(f"saved, but the local vault was not updated ({e}); `icp sync` will")
         return _write_report(args, result, None)
@@ -1055,6 +1065,8 @@ def main(argv=None) -> int:
                             "title, notes, totp (otpauth:// URI or base32 key, \"\" removes it), "
                             "add_sites, remove_sites, trash (true = --delete) (keeps secrets out "
                             "of the process list)")
+    ep.add_argument("--uuid", help="the login's id (record name, `uuid` in the vault) - picks "
+                                   "it exactly when several logins share website + username")
     ep.add_argument("--delete", action="store_true",
                     help="move the login to Recently Deleted, like the Passwords app (it can be "
                          "recovered there); not combinable with other changes")
