@@ -140,8 +140,16 @@ def encrypt_record_payload(record, class_key: bytes, item: dict) -> dict:
 
 
 def decrypt_items(items, class_keys: dict) -> list[dict]:
-    """Decrypt each `item` record whose parent class key we hold -> the item plist dict."""
-    return [d for d in (decrypt_record(it, class_keys) for it in items) if d is not None]
+    """Decrypt each `item` record whose parent class key we hold -> the item plist dict. Items
+    without a `UUID` attribute get their record name there - CKKS keeps the two identical, and
+    the vault needs it to tell apart logins that share website + username."""
+    out = []
+    for it in items:
+        d = decrypt_record(it, class_keys)
+        if d is not None:
+            d.setdefault("UUID", it.record_name)
+            out.append(d)
+    return out
 
 
 def build_credential_store(records_by_type: dict, our_peer_id: str,
