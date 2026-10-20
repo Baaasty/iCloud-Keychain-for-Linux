@@ -303,6 +303,16 @@ class SidecarMergeTests(unittest.TestCase):
                         "supportsPasskey", "enrollPasskeyURL"):
             self.assertNotIn(dropped, blob)
 
+    def test_extra_websites_are_kept_and_matched(self):
+        # s_as = the entry's other websites in the Passwords app: [{"s": "<host>"}]
+        store = CredentialStore.from_items(self._items(
+            {"s_as": [{"s": "shop.example.org"}, {"s": b"login.ex.net"}, {"x": 1}, "junk"]}))
+        c = store.all()[0]
+        self.assertEqual(c.sites, ("shop.example.org", "login.ex.net"))
+        self.assertEqual(store.match("https://shop.example.org/cart"), [c])
+        self.assertEqual(store.match("ex.com"), [c])
+        self.assertEqual(store.match("other.org"), [])
+
     def test_last_used_drives_ordering(self):
         # mdat is unix seconds; the sidecar's lUsed is Apple absolute time (+978307200), so
         # 780_000_000 resolves later than stale's mdat.
