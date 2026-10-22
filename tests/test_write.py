@@ -64,16 +64,16 @@ def _keyring(current=CLASS_UUID):
                          key_zone={CLASS_UUID: ZONE}, current={(ZONE, "classA"): current})
 
 
-def _item_record(uuid, item, *, etag="etag-1", extra=()):
+def _item_record(uuid, item, *, etag="etag-1", extra=(), gen=0, zone=ZONE):
     """An encrypted `item` record the way the server hands it out."""
-    stub = _record(uuid, "item", [("parentkeyref", "ref", CLASS_UUID), ("gen", "int", 0),
-                                  ("encver", "int", 2), *extra])
+    stub = _record(uuid, "item", [("parentkeyref", "ref", CLASS_UUID), ("gen", "int", gen),
+                                  ("encver", "int", 2), *extra], zone=zone)
     payload = pipeline.encrypt_record_payload(stub, CLASS_KEY, item)
     return _record(uuid, "item", [
-        ("data", "bytes", payload["data"]), ("encver", "int", 2), ("gen", "int", 0),
+        ("data", "bytes", payload["data"]), ("encver", "int", 2), ("gen", "int", gen),
         ("parentkeyref", "ref", CLASS_UUID), ("server_wascurrent", "int", 1),
         ("uploadver", "str", "iOS 26"), ("wrappedkey", "str", payload["wrappedkey"]), *extra,
-    ], etag=etag)
+    ], etag=etag, zone=zone)
 
 
 def _login(srvr="example.com", acct="anna", pw=b"old-pass"):
@@ -381,7 +381,9 @@ class _FakeServer:
         return {"item": list(self.store.values())}, {}
 
 
-class EditFlowTests(unittest.TestCase):
+class _Sandbox(unittest.TestCase):
+    """Write state, backups and the vault key in a temp dir; one fixed class key."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.patches = [mock.patch.object(write.paths, "config_dir", lambda: Path(self.tmp.name)),
@@ -396,6 +398,8 @@ class EditFlowTests(unittest.TestCase):
             p.stop()
         self.tmp.cleanup()
 
+
+class EditFlowTests(_Sandbox):
     def _server(self, **kw):
         login = {**_login(), "UUID": "U-1"}
         side = {**_sidecar(), "UUID": "U-2"}
@@ -523,6 +527,251 @@ class EditFlowTests(unittest.TestCase):
                              apply=False)
         self.assertEqual(srv.calls, [])
         self.assertTrue(res["dry_run"] and res["rekey"])
+
+
+def _real_login(srvr="example.com", acct="anna", pw=b"old-pass"):
+    """A login with the attribute set a real device writes (names/types as `icp diag write`)."""
+    return {**_login(srvr, acct, pw), "UUID": "", "atyp": "form", "ptcl": "htps", "port": 443,
+            "path": "/signin", "sdmn": "", "desc": "web form password", "icmt": "a comment",
+            "musr": b"", "sync": True, "type": 0, "cusi": 0, "invi": 0, "nega": 0, "scrp": 0,
+            "cdat": datetime.datetime(2024, 1, 1), "odd1": "kept out"}
+
+
+def _real_sidecar(srvr="example.com", acct="anna"):
+    return {**_sidecar(srvr, acct), "UUID": "", "atyp": "form", "ptcl": "htps", "port": 0,
+            "path": "", "sdmn": "", "desc": "", "pdmn": "ak", "musr": b"", "sync": True,
+            "type": 0, "bin0": b"\x01\x02", "cdat": datetime.datetime(2024, 1, 1)}
+
+
+SECRETS = ("s3cret-Pass", "private notes", "JBSWY3DPEHPK3PXP")
+NEW = {"site": "https://new.example/login", "user": "bob", "password": "s3cret-Pass"}
+
+
+class CreateFlowTests(_Sandbox):
+    def _server(self, sidecar=True, **kw):
+        recs = [_item_record("U-1", {**_real_login(), "UUID": "U-1"}, gen=7)]
+        if sidecar:
+            recs.append(_item_record("U-2", {**_real_sidecar(), "UUID": "U-2"}, gen=3))
+        srv = _FakeServer(recs, **kw)
+        return srv, mock.patch.object(write, "fetch", srv.fetch)
+
+    def _create(self, srv, p, apply=True, **kw):
+        args = {**NEW, **kw}
+        with p:
+            return write.create(srv, args.pop("site"), args.pop("user"), args.pop("password"),
+                                apply=apply, **args)
+
+    def _stored(self, srv, uuid):
+        return pipeline.decrypt_record(srv.store[uuid], {CLASS_UUID: CLASS_KEY})
+
+    def test_new_login_layout(self):
+        srv, p = self._server()
+        res = self._create(srv, p)
+        self.assertEqual(srv.calls, [("save", res["uuid"])])     # no metadata asked for
+        self.assertFalse(res["sidecar"])
+        rec = srv.store[res["uuid"]]
+        self.assertEqual(write.record_zone(rec), ZONE)
+        self.assertEqual(rec.fields["gen"], 0)                   # fresh item, template had 7
+        self.assertEqual(rec.fields["server_wascurrent"], 0)
+        item = self._stored(srv, res["uuid"])
+        self.assertEqual(item["UUID"], res["uuid"])
+        self.assertEqual(sorted(item), sorted(set(_real_login()) - {"sha1", "odd1"}))
+        self.assertEqual((item["class"], item["agrp"], item["srvr"], item["acct"], item["labl"]),
+                         ("inet", write.AGRP_LOGIN, "new.example", "bob", "new.example (bob)"))
+        self.assertEqual(item["v_Data"], b"s3cret-Pass")
+        self.assertEqual((item["ptcl"], item["port"], item["path"], item["desc"], item["icmt"]),
+                         ("htps", 0, "", "", ""))
+        self.assertEqual((item["pdmn"], item["atyp"], item["sync"], item["tomb"]),
+                         ("ak", "form", True, 0))
+        self.assertEqual(item["cdat"], item["mdat"])
+        self.assertEqual(res["skipped_attrs"], ["odd1"])
+        self.assertEqual(res["login_attrs"]["v_Data"], "bytes")
+
+    def test_http_site_keeps_its_protocol(self):
+        srv, p = self._server()
+        res = self._create(srv, p, site="http://old.example")
+        self.assertEqual(self._stored(srv, res["uuid"])["ptcl"], "http")
+
+    def test_metadata_when_title_notes_totp_given(self):
+        srv, p = self._server()
+        res = self._create(srv, p, title="New Example", notes="private notes",
+                           totp="otpauth://totp/ACME:bob?secret=JBSWY3DPEHPK3PXP&issuer=ACME")
+        self.assertTrue(res["sidecar"])
+        self.assertEqual([c[0] for c in srv.calls], ["save", "save"])
+        self.assertEqual(srv.calls[0][1], res["uuid"])            # login first
+        side = self._stored(srv, srv.calls[1][1])
+        self.assertEqual((side["agrp"], side["srvr"], side["acct"], side["labl"]),
+                         (write.AGRP_SIDECAR, "new.example", "bob",
+                          f"{write.SIDECAR_LABEL}new.example (bob)"))
+        self.assertNotIn("bin0", side)
+        self.assertEqual(srv.store[srv.calls[1][1]].fields["gen"], 0)
+        body = plistlib.loads(side["v_Data"])
+        self.assertEqual((body["title"], body["notes"], body["s_as"]),
+                         (b"New Example", b"private notes", []))
+        self.assertEqual(body["totp"]["issuer"], "ACME")
+        # the vault reads it back as one login with its metadata
+        from icp.vault.host import CredentialStore
+        cred, = CredentialStore.from_items([self._stored(srv, res["uuid"]), side]).all()
+        self.assertEqual((cred.title, cred.uuid, cred.notes), ("New Example", res["uuid"],
+                                                               "private notes"))
+        self.assertTrue(cred.totp)
+
+    def test_no_metadata_template_creates_login_only(self):
+        srv, p = self._server(sidecar=False)
+        res = self._create(srv, p, title="X")
+        self.assertEqual(srv.calls, [("save", res["uuid"])])
+        self.assertFalse(res["sidecar"])
+        self.assertTrue(res["warnings"])
+
+    def test_duplicate_is_refused(self):
+        srv, p = self._server()
+        with self.assertRaises(write.ExistsError):
+            self._create(srv, p, site="EXAMPLE.com", user="Anna")
+        self.assertEqual(srv.calls, [])
+
+    def test_orphan_metadata_is_refused(self):
+        srv, p = self._server()
+        srv.store["U-9"] = _item_record("U-9", {**_real_sidecar("new.example", "bob"),
+                                                "UUID": "U-9"})
+        with self.assertRaises(write.WriteError):
+            self._create(srv, p, title="X")
+        self.assertEqual(srv.calls, [])
+
+    def test_template_needs_current_key_and_no_pcs(self):
+        srv, p = self._server()
+        srv.store["U-1"] = _item_record("U-1", {**_real_login(), "UUID": "U-1"},
+                                        extra=(("pcsservice", "int", 1),))
+        with self.assertRaises(write.WriteError):
+            self._create(srv, p)
+        srv, p = self._server()
+        with mock.patch.object(write, "build_keyring", lambda r, t: _keyring("KEY-NEWER")), \
+                self.assertRaises(write.WriteError):
+            self._create(srv, p)
+        self.assertEqual(srv.calls, [])
+
+    def test_bad_input(self):
+        srv, p = self._server()
+        for kw in ({"site": "not a site"}, {"user": ""}, {"password": ""},
+                   {"totp": "otpauth://hotp/x?secret=JBSWY3DP"}):
+            with self.assertRaises(write.WriteError):
+                self._create(srv, p, **kw)
+        self.assertEqual(srv.calls, [])
+
+    def test_dry_run_sends_nothing(self):
+        srv, p = self._server()
+        res = self._create(srv, p, apply=False, title="T", notes="private notes")
+        self.assertEqual(srv.calls, [])
+        self.assertTrue(res["dry_run"] and res["sidecar"])
+        self.assertNotIn(res["uuid"], srv.store)
+        self.assertNotIn("login_item", res)
+        self.assertEqual(write.load_state().get("writes"), [])
+
+    def test_bad_read_back_blocks(self):
+        srv, p = self._server(corrupt_reads=True)
+        with self.assertRaises(write.WriteError):
+            self._create(srv, p)
+        self.assertEqual([c[0] for c in srv.calls], ["save"])
+        self.assertTrue(write.load_state()["blocked"])
+
+    def test_read_back_fetch_failure_blocks(self):
+        srv, p = self._server()
+        reads = []
+
+        def flaky(client):
+            reads.append(1)
+            if len(reads) > 1:
+                raise OSError("network down")
+            return srv.fetch(client)
+        with mock.patch.object(write, "fetch", flaky), self.assertRaises(write.WriteError):
+            write.create(srv, "new.example", "bob", "s3cret-Pass", apply=True)
+        self.assertTrue(write.load_state()["blocked"])
+
+    def test_blocked_state_sends_nothing(self):
+        write.save_state({"writes": [], "blocked": "earlier error"})
+        srv, p = self._server()
+        with self.assertRaises(write.WriteError):
+            self._create(srv, p)
+        self.assertEqual(srv.calls, [])
+
+    def test_report_has_no_secrets(self):
+        import json
+        srv, p = self._server()
+        for apply in (False, True):
+            write.save_state({"writes": [], "blocked": None})
+            res = self._create(srv, p, apply=apply, user=f"bob{apply}", title="T",
+                               notes="private notes", totp="JBSWY3DPEHPK3PXP")
+            public = {k: v for k, v in res.items() if k not in ("login_item", "sidecar_item")}
+            text = json.dumps(public)
+            for secret in SECRETS:
+                self.assertNotIn(secret, text)
+
+
+class AddCommandTests(_Sandbox):
+    """`icp add` end to end against the fake server: stdin JSON in, report out."""
+
+    def _run(self, payload, *argv):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from icp.cli import app
+        srv = _FakeServer([_item_record("U-1", {**_real_login(), "UUID": "U-1"}),
+                           _item_record("U-2", {**_real_sidecar(), "UUID": "U-2"})])
+        session = mock.Mock(side_effect=lambda args: (io.StringIO(), srv))
+        appended = []
+        out = io.StringIO()
+        stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload) + "\n")
+        with mock.patch.object(write, "fetch", srv.fetch), \
+                mock.patch.object(app, "_write_session", session), \
+                mock.patch.object(app, "_append_vault", lambda *a: appended.append(a)), \
+                mock.patch("sys.stdin", stdin), redirect_stdout(out):
+            code = app.main(["add", "--stdin-json", *argv])
+        return code, out.getvalue(), srv, appended, session
+
+    def test_dry_run_json(self):
+        import json
+        code, out, srv, appended, _ = self._run({**NEW, "notes": "private notes"}, "--json")
+        self.assertEqual(code, 0)
+        res = json.loads(out)
+        self.assertEqual((res["ok"], res["dryRun"], res["uuid"], res["site"], res["user"],
+                          res["sidecar"]), (True, True, None, "new.example", "bob", True))
+        self.assertEqual((srv.calls, appended), ([], []))
+        for secret in SECRETS:
+            self.assertNotIn(secret, out)
+
+    def test_apply_appends_to_vault(self):
+        import json
+        code, out, srv, appended, _ = self._run(NEW, "--apply", "--json")
+        self.assertEqual(code, 0)
+        res = json.loads(out)
+        self.assertEqual((res["dryRun"], res["sidecar"]), (False, False))
+        self.assertEqual(srv.calls, [("save", res["uuid"])])
+        (login, sidecar), = appended
+        self.assertEqual((login["UUID"], sidecar), (res["uuid"], None))
+        self.assertNotIn("s3cret-Pass", out)
+
+    def test_text_dry_run_lists_names_only(self):
+        code, out, *_ = self._run({**NEW, "title": "T", "totp": "JBSWY3DPEHPK3PXP"})
+        self.assertEqual(code, 0)
+        self.assertIn("v_Data:bytes", out)
+        self.assertIn("Dry run", out)
+        for secret in SECRETS:
+            self.assertNotIn(secret, out)
+
+    def test_exists_exit_code(self):
+        import json
+        code, out, srv, *_ = self._run({**NEW, "site": "example.com", "user": "anna"}, "--json")
+        self.assertEqual(code, 3)
+        res = json.loads(out)
+        self.assertEqual((res["ok"], res["exists"]), (False, True))
+        self.assertIn("exists", res["error"])
+        self.assertEqual(srv.calls, [])
+
+    def test_validation_before_any_network(self):
+        for payload in ({"site": "a.example", "user": "bob"}, {**NEW, "notes": 5}, "not json\n",
+                        "[1]\n"):
+            code, _out, srv, _a, session = self._run(payload, "--json")
+            self.assertEqual(code, 1)
+            session.assert_not_called()
 
 
 class PacingTests(unittest.TestCase):

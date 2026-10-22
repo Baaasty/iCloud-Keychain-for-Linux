@@ -897,6 +897,101 @@ def cmd_edit(args) -> int:
             lock.close()
 
 
+def _append_vault(login: dict, sidecar: dict | None) -> None:
+    """Add a newly created login to the local vault right away (the next sync would too); the
+    other entries stay as they are."""
+    from ..vault import store as vault
+    from ..vault.host import CredentialStore
+
+    new = CredentialStore.from_items([login] + ([sidecar] if sidecar else [])).all()
+    vault.save_vault(CredentialStore(vault.load_vault().all() + new))
+
+
+EXIT_EXISTS = 3   # `icp add`: a login for this website + username exists (use `icp edit`)
+
+
+def _add_report(args, result: dict | None, error: str | None, code: int = 1) -> int:
+    """`icp add` output. Never prints the password, notes or 2FA code - only names and types."""
+    import json
+    if getattr(args, "json", False):
+        out = {"ok": error is None, "error": error}
+        if result:
+            out.update({"uuid": None if result["dry_run"] else result["uuid"],
+                        "site": result["site"], "user": result["user"],
+                        "sidecar": result["sidecar"], "dryRun": result["dry_run"],
+                        "zone": result["zone"], "warnings": result["warnings"]})
+        if code == EXIT_EXISTS:
+            out["exists"] = True
+        print(json.dumps(out))
+    elif error:
+        ui.err(error)
+    else:
+        for line in result["diff"]:
+            ui.out(f"  {line}")
+        for line in result["warnings"]:
+            ui.warn(line)
+        if result["dry_run"]:
+            ui.out("  login attributes:    " + ", ".join(f"{k}:{v}" for k, v
+                                                         in result["login_attrs"].items()))
+            if result["sidecar"]:
+                ui.out("  metadata attributes: " + ", ".join(f"{k}:{v}" for k, v
+                                                             in result["sidecar_attrs"].items()))
+            if result["skipped_attrs"]:
+                ui.out("  not taken from the template: " + ", ".join(result["skipped_attrs"]))
+            ui.out("Dry run - nothing sent. Add --apply to save it to iCloud.")
+        else:
+            ui.out(f"Saved to iCloud: {', '.join(result['saved'])} (id {result['uuid']}).")
+            import shlex
+            ui.out(f"  undo: icp edit {shlex.quote(result['site'])} {shlex.quote(result['user'])} "
+                   f"--uuid {result['uuid']} --delete --apply")
+    return 0 if error is None else code
+
+
+def cmd_add(args) -> int:
+    """Create a new login in iCloud Keychain (dry run unless --apply). Input is one JSON line on
+    stdin - the password, notes and 2FA code are secrets and never go on the command line."""
+    import json
+    from ..keychain import write
+    from ..octagon.client import OctagonError
+    from ..transport.cloudkit import CloudKitError
+
+    try:
+        data = json.loads(sys.stdin.readline() or "{}")
+    except ValueError:
+        return _add_report(args, None, "stdin is not JSON")
+    if not isinstance(data, dict):
+        return _add_report(args, None, "stdin must be a JSON object")
+    fields = {}
+    for key in ("site", "user", "password", "title", "notes", "totp"):
+        value = data.get(key)
+        if value is not None and not isinstance(value, str):
+            return _add_report(args, None, f"`{key}` must be a string")
+        fields[key] = value
+    missing = [k for k in ("site", "user", "password") if not fields[k]]
+    if missing:
+        return _add_report(args, None, "missing: " + ", ".join(missing))
+    lock = None
+    try:
+        lock, client = _write_session(args)
+        result = write.create(client, fields["site"], fields["user"], fields["password"],
+                              title=fields["title"], notes=fields["notes"], totp=fields["totp"],
+                              apply=args.apply)
+        if args.apply:
+            try:
+                _append_vault(result["login_item"], result.get("sidecar_item"))
+            except Exception as e:  # noqa: BLE001 - the save itself went through
+                ui.warn(f"saved, but the local vault was not updated ({e}); `icp sync` will")
+        return _add_report(args, result, None)
+    except write.ExistsError as e:
+        return _add_report(args, None, str(e), EXIT_EXISTS)
+    except (write.WriteError, SessionError, OctagonError, CloudKitError, icloud.ICloudError,
+            AnisetteError, GSAError, ValueError) as e:
+        return _add_report(args, None, str(e))
+    finally:
+        if lock:
+            lock.close()
+
+
 def cmd_restore(args) -> int:
     """Put the pre-edit version of a record back (from ~/.config/icp/backup)."""
     from ..keychain import write
@@ -999,7 +1094,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="icp",
         description="iCloud Passwords for Linux - iCloud Keychain autofill (read-only by default; "
-                    "`edit`/`restore` write only with --apply)")
+                    "`add`/`edit`/`restore` write only with --apply)")
     p.add_argument("--anisette",
                    help="anisette server URL (default: $ICP_ANISETTE_URL or localhost:6969)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1075,6 +1170,17 @@ def main(argv=None) -> int:
     ep.add_argument("--apply", action="store_true", help="really save (default: dry run)")
     ep.add_argument("--json", action="store_true", help="machine-readable result")
     ep.set_defaults(func=cmd_edit)
+
+    ap = sub.add_parser(
+        "add", help="create a new login in iCloud Keychain (dry run unless --apply)")
+    ap.add_argument("--stdin-json", action="store_true", required=True,
+                    help="read the login as one JSON line from stdin: site, user, password "
+                         "(required), title, notes, totp (otpauth:// URI or base32 key) - keeps "
+                         "secrets out of the process list")
+    ap.add_argument("--apply", action="store_true", help="really save (default: dry run)")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable result (exit code 3: the login exists already)")
+    ap.set_defaults(func=cmd_add)
 
     rp = sub.add_parser("restore", help="put the pre-edit version of a record back")
     rp.add_argument("uuid", help="record uuid of a backup (listed after an edit and in "

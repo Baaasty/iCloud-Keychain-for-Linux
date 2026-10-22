@@ -139,9 +139,9 @@ if your sign-in has expired they stop and wait for `icp login`. `icp status` sho
 Shared password groups you created in the Passwords app are synced too; groups someone else
 shared with you are not yet.
 
-## Editing logins (experimental)
+## Editing and creating logins (experimental)
 
-`icp` can also change an existing login and save it back to iCloud Keychain, so the change shows
+`icp` can also change an existing login (or create a new one) and save it to iCloud Keychain, so the change shows
 up on your iPhone and Mac. This is **opt-in per command**: every edit is a dry run that prints
 what would change, and only `--apply` sends it. Treat it as experimental - it has been checked
 against one real account, not many.
@@ -164,7 +164,22 @@ https, another port or path), pick one with `--uuid` (the `uuid` the vault store
 Title, notes, extra websites and codes live in the login's Passwords-app metadata; a login that
 has none yet must be edited once in the Passwords app first. Secrets (password, notes, code) are
 best passed via `--password-stdin` or `--stdin-json`, never as arguments. Logins in shared groups
-stay read-only, and new logins cannot be created.
+stay read-only.
+
+**Creating a login.** `icp add` creates a new login, guarded like `edit` (dry run by default, the
+same pacing, block and read-back). The login comes as one JSON line on stdin, so no secret ends
+up in the process list:
+
+```
+echo '{"site":"example.com","user":"anna","password":"..."}' | icp add --stdin-json          # dry run
+icp add --stdin-json --apply --json < new-login.json   # {site, user, password, title?, notes?, totp?}
+```
+
+The new item is modelled on one of your existing logins (its record layout and attribute set, not
+its values), so it looks like one your devices wrote. Title, notes and a 2FA code go into
+Passwords-app metadata, created only when one of them is given. A website + username that
+already has a login is refused (exit code 3) - change that one with `icp edit`. Undo with
+`icp edit <site> <user> --uuid <id> --delete --apply` (the id is printed after the save).
 
 **Safety model.** Each rule is enforced in `icp/keychain/write.py`, not by the caller:
 
@@ -205,6 +220,7 @@ sync     refresh your passwords now (--background for unattended runs, --force)
 status   last sync, next allowed sync, whether a login is needed (--json)
 diag     read-only diagnostics: zones, groups, write (shapes/counts only, no secrets)
 edit     change one login - dry run unless --apply (experimental, see above)
+add      create a new login from JSON on stdin - dry run unless --apply (experimental)
 restore  put a backed-up record back after an edit (dry run unless --apply)
 write-state  edit pacing and block state (--clear lifts a block after an error)
 logout   sign out (use --wipe-device to also forget this device)

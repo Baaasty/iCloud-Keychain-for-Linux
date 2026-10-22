@@ -1,6 +1,6 @@
 """Write path: edit an existing Passwords login (website, username, password, title, notes,
-extra websites, 2FA code) and save it back to iCloud Keychain, so the change reaches the user's
-other devices.
+extra websites, 2FA code) or create a new one, and save it to iCloud Keychain, so the change
+reaches the user's other devices.
 
 Website (`srvr`) and username (`acct`) are part of an item's primary key. Devices reconcile an
 incoming modify by primary key only (CKKSIncomingQueueOperation -> SecDbItemInsertOrReplace),
@@ -475,18 +475,24 @@ def build_save(record: ckks.CloudKitRecord, item: dict, keyring: Keyring) -> byt
 
 
 def build_insert(template: ckks.CloudKitRecord, item: dict,
-                 keyring: Keyring) -> tuple[str, bytes, dict]:
+                 keyring: Keyring, *, fresh: bool = False) -> tuple[str, bytes, dict]:
     """`item` as a NEW record next to `template` (same zone + class key) under a fresh UUID,
     verified by decrypting the result. -> (new uuid, RecordSaveRequest, item as stored - its
-    `UUID` attribute follows the record name)."""
+    `UUID` attribute follows the record name). `fresh`: a brand-new item, not a moved one -
+    its generation count starts at 0 (CKKS counts up from 0 on each modify of an item)."""
     class_key = keyring.check_current(template)
     if template.fields.get("encver", 2) != 2:
         raise WriteError(f"unsupported encver {template.fields.get('encver')}")
     new_uuid = str(uuid_mod.uuid4()).upper()
     item = {**item, "UUID": new_uuid} if "UUID" in item else item
     stub = dataclasses.replace(template, record_name=new_uuid)
+    replace = {}
+    if fresh and "gen" in template.fields:
+        stub.fields = {**template.fields, "gen": 0}   # gen is part of the AAD
+        replace["gen"] = ckks.encode_int_value(0)
     new = pipeline.encrypt_record_payload(stub, class_key, item)
     record_bytes = ckks.build_insert_record(template, new_uuid, {
+        **replace,
         "data": ckks.encode_bytes_value(new["data"]),
         "wrappedkey": ckks.encode_string_value(new["wrappedkey"]),
     })
@@ -635,6 +641,26 @@ def _send(client, state: dict, op: str, what: str, rec, req: bytes, result: dict
     done.append(f"{op} {what}")
 
 
+def _read_back(client, state: dict, writes: list, result: dict, then: str) -> None:
+    """Fetch again and check that every saved record decrypts to exactly what was sent. Any
+    failure blocks further writes."""
+    try:
+        records2, tlks2 = fetch(client)
+    except Exception as e:
+        block(state, f"read-back after {', '.join(result['saved'])} failed: "
+                     f"{type(e).__name__}: {e}")
+        raise WriteError(f"saved ({', '.join(result['saved'])}), but the read-back failed: {e} - "
+                         f"{then}") from e
+    keyring2 = build_keyring(records2, tlks2)
+    for _op, what, _rec, item, _req, uuid in writes:
+        fresh = _find_record(records2, uuid)
+        back = pipeline.decrypt_record(fresh, keyring2.class_keys) if fresh else None
+        if back is None or not _plist_equal(back, item):
+            block(state, f"read-back of {uuid} ({what}) does not match")
+            raise WriteError(f"saved, but the read-back of the {what} does not match - {then}; "
+                             "check the entry on an Apple device")
+
+
 def edit(client, domain: str, username: str, changes: Changes, *, apply: bool,
          uuid: str | None = None) -> dict:
     """Edit one login (`uuid` picks it exactly, see select_entry). Dry run (apply=False) does
@@ -687,21 +713,7 @@ def edit(client, domain: str, username: str, changes: Changes, *, apply: bool,
         _send(client, state, op, what, rec, req, result)
 
     # read back: the server must now hold exactly the edit - before anything old is deleted
-    try:
-        records2, tlks2 = fetch(client)
-    except Exception as e:
-        block(state, f"read-back after {', '.join(result['saved'])} failed: "
-                     f"{type(e).__name__}: {e}")
-        raise WriteError(f"saved ({', '.join(result['saved'])}), but the read-back failed: {e} - "
-                         "nothing old was deleted, writes are blocked") from e
-    keyring2 = build_keyring(records2, tlks2)
-    for op, what, _rec, item, _req, uuid in writes:
-        fresh = _find_record(records2, uuid)
-        back = pipeline.decrypt_record(fresh, keyring2.class_keys) if fresh else None
-        if back is None or not _plist_equal(back, item):
-            block(state, f"read-back of {uuid} ({what}) does not match")
-            raise WriteError(f"saved, but the read-back of the {what} does not match - nothing "
-                             "old was deleted, writes are blocked; check the entry on an Apple device")
+    _read_back(client, state, writes, result, "nothing old was deleted, writes are blocked")
 
     for op, what, rec, req in deletes:
         try:
@@ -711,6 +723,200 @@ def edit(client, domain: str, username: str, changes: Changes, *, apply: bool,
                              "(duplicate), delete it on an Apple device") from e
     result["login"] = login if login is not None else entry.login
     result["sidecar"] = sidecar if sidecar is not None else entry.sidecar
+    return result
+
+
+# --- create ----------------------------------------------------------------------------------
+#
+# A new login is modelled on a real one of the same account: its record (zone, class key, record
+# fields) is the insert template, and its attribute set decides which attributes the new item
+# carries, so the item looks like one the user's own devices wrote. Identity and value
+# attributes are set from the input; structural ones are copied; per-item content starts empty;
+# anything else is left out and listed in the report.
+
+CREATE_ZONE = "Passwords"
+# copied from the template: protection class (must match the template's class key), auth type,
+# multi-user / view hints
+_COPY_ATTRS = frozenset({"pdmn", "atyp", "musr", "vwht"})
+# per-item content: the template's attribute, with the empty value of its type
+_EMPTY_ATTRS = frozenset({"path", "sdmn", "port", "desc", "icmt", "alis", "crtr", "type", "cusi",
+                          "invi", "nega", "scrp"})
+
+
+class ExistsError(WriteError):
+    """A login with this website + username exists already: CKKS keeps one item per primary key,
+    so a second one would replace it on a device. Change it with `edit` instead."""
+
+
+def _empty_like(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0
+    if isinstance(value, float):
+        return 0.0
+    if isinstance(value, str):
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return b""
+    return None
+
+
+def _new_item(template: dict, fixed: dict) -> tuple[dict, list]:
+    """(new item, names of template attributes left out). `fixed` wins over the template."""
+    item, skipped = {}, []
+    for name, value in template.items():
+        if name in fixed or name == "sha1":    # receivers compute sha1 themselves
+            continue
+        if name in _COPY_ATTRS:
+            item[name] = value
+        elif name in _EMPTY_ATTRS and _empty_like(value) is not None:
+            item[name] = _empty_like(value)
+        else:
+            skipped.append(name)
+    if "pdmn" not in item:
+        raise WriteError("template login has no protection class (pdmn) - not creating")
+    item.update(fixed)
+    return item, sorted(skipped)
+
+
+def _stamp(value) -> float:
+    if isinstance(value, datetime.datetime):
+        return value.replace(tzinfo=datetime.timezone.utc).timestamp()
+    return 0.0
+
+
+def pick_template(pairs: list, keyring: Keyring, agrp: str, zones: tuple):
+    """The (record, item) to model a new login or sidecar on: an own item of `agrp` under the
+    current class key, in the first of `zones` that has one, without per-item PCS identity
+    fields (those must never be copied). Prefers https and then the newest - closest to what
+    the user's devices write today. None if there is none."""
+    for zone in zones:
+        cands = []
+        for rec, it in pairs:
+            if (_is_tomb(it) or str(it.get("agrp") or "") != agrp
+                    or it.get("class") not in (None, "inet") or record_zone(rec) != zone
+                    or any(n.startswith("pcs") for n in rec.fields)
+                    or rec.fields.get("encver", 2) != 2):
+                continue
+            if agrp == AGRP_SIDECAR and not str(it.get("labl") or "").startswith(SIDECAR_LABEL):
+                continue
+            try:
+                keyring.check_current(rec)
+            except WriteError:
+                continue
+            cands.append((rec, it))
+        if cands:
+            return max(cands, key=lambda c: (c[1].get("ptcl") == "htps", _stamp(c[1].get("cdat"))))
+    return None
+
+
+def new_login(template: dict, srvr: str, acct: str, password: str, ptcl: str,
+              stamp: datetime.datetime) -> tuple[dict, list]:
+    return _new_item(template, {
+        "class": "inet", "agrp": AGRP_LOGIN, "srvr": srvr, "acct": acct, "ptcl": ptcl,
+        "labl": f"{srvr} ({acct})", "v_Data": password.encode(), "cdat": stamp, "mdat": stamp,
+        "tomb": 0, "sync": True, "UUID": "",       # UUID follows the record name (build_insert)
+    })
+
+
+def new_sidecar(template: dict, srvr: str, acct: str, ptcl: str, stamp: datetime.datetime, *,
+                title: str | None, notes: str | None, totp_block: dict | None) -> tuple[dict, list]:
+    """Passwords-app metadata for a new login. Title and notes are stored as bytes, like the
+    Passwords app does; the title defaults to the website."""
+    payload = {"title": (title or srvr).encode(), "notes": (notes or "").encode(), "s_as": []}
+    if totp_block:
+        payload["totp"] = totp_block
+    return _new_item(template, {
+        "class": "inet", "agrp": AGRP_SIDECAR, "srvr": srvr, "acct": acct, "ptcl": ptcl,
+        "labl": f"{SIDECAR_LABEL}{srvr} ({acct})",
+        "v_Data": plistlib.dumps(payload, fmt=plistlib.FMT_BINARY),
+        "cdat": stamp, "mdat": stamp, "tomb": 0, "sync": True, "UUID": "",
+    })
+
+
+def _shape_of(item: dict | None) -> dict:
+    return {k: type(v).__name__ for k, v in sorted((item or {}).items())}
+
+
+def create(client, site: str, username: str, password: str, *, title: str | None = None,
+           notes: str | None = None, totp: str | None = None, apply: bool) -> dict:
+    """Create a new login (+ Passwords metadata when title, notes or a 2FA code are given).
+    Dry run (apply=False) builds and self-checks the records but sends nothing. Never deletes.
+    Returns {ok, dry_run, uuid, site, user, sidecar, zone, diff, warnings, login_attrs,
+    sidecar_attrs, skipped_attrs, saved, backups} - names and types only - plus the items as
+    `login_item` / `sidecar_item` for the local vault (secrets: never print those)."""
+    srvr = _site_host(site or "")
+    if not username:
+        raise WriteError("username is required")
+    if not password:
+        raise WriteError("password is required")
+    ptcl = "http" if site.strip().lower().startswith("http://") else "htps"
+    totp_block = None
+    if totp and totp.strip():
+        from .. import totp as totp_codes
+        try:
+            totp_block = totp_codes.sidecar_from_input(totp)
+        except ValueError as e:
+            raise WriteError(str(e)) from None
+    want_sidecar = bool(title or notes or totp_block)
+
+    records, tlks = fetch(client)
+    keyring = build_keyring(records, tlks)
+    pairs = _decrypted(records, keyring)
+    key = (_norm(srvr), _norm(username))
+    if any((_norm(e.domain), _norm(e.username)) == key for e in find_entries(pairs)):
+        raise ExistsError(f"a login for {srvr} / {username!r} exists already - "
+                          "change it with `icp edit` instead")
+    if any(not _is_tomb(it) and str(it.get("agrp") or "") == AGRP_SIDECAR
+           and (_norm(it.get("srvr")), _norm(it.get("acct"))) == key for _r, it in pairs):
+        raise WriteError(f"Passwords metadata for {srvr} / {username!r} exists without a login - "
+                         "check it on an Apple device first")
+
+    tpl = pick_template(pairs, keyring, AGRP_LOGIN, (CREATE_ZONE,))
+    if tpl is None:
+        raise WriteError(f"no login under the current class key in {CREATE_ZONE} to model the "
+                         "new one on - create one in the Passwords app first")
+    stamp = _now()
+    login, skipped = new_login(tpl[1], srvr, username, password, ptcl, stamp)
+    new_uuid, req, login = build_insert(tpl[0], login, keyring, fresh=True)
+    writes = [("insert", "login", None, login, req, new_uuid)]
+    zone = record_zone(tpl[0])
+
+    sidecar, side_skipped, warnings = None, [], []
+    if want_sidecar:
+        stpl = pick_template(pairs, keyring, AGRP_SIDECAR,
+                             (zone,) + tuple(z for z in WRITE_ZONES if z != zone))
+        if stpl is None:
+            warnings.append("no Passwords metadata to model on - title, notes and 2FA code were "
+                            "not saved; add them in the Passwords app")
+        else:
+            sidecar, side_skipped = new_sidecar(stpl[1], srvr, username, ptcl, stamp, title=title,
+                                                notes=notes, totp_block=totp_block)
+            side_uuid, req, sidecar = build_insert(stpl[0], sidecar, keyring, fresh=True)
+            writes.append(("insert", "metadata", None, sidecar, req, side_uuid))
+
+    diff = [f"new login: {srvr} / {username!r} ({ptcl}, zone {zone})"]
+    if sidecar is not None:
+        parts = [n for n, v in (("title", title), ("notes", notes), ("2FA code", totp_block)) if v]
+        diff.append("metadata: " + ", ".join(parts))
+    result = {"ok": True, "dry_run": not apply, "uuid": new_uuid, "site": srvr,
+              "user": username, "sidecar": sidecar is not None, "zone": zone, "diff": diff,
+              "warnings": warnings, "login_attrs": _shape_of(login),
+              "sidecar_attrs": _shape_of(sidecar),
+              "skipped_attrs": sorted(set(skipped) | set(side_skipped)),
+              "saved": [], "backups": []}
+    if not apply:
+        return result
+
+    state = load_state()
+    allowed, why = may_write(state, n=len(writes))
+    if not allowed:
+        raise WriteError(why)
+    for op, what, rec, _item, req, _uuid in writes:
+        _send(client, state, op, what, rec, req, result)
+    _read_back(client, state, writes, result, "writes are blocked")
+    result["login_item"], result["sidecar_item"] = login, sidecar
     return result
 
 

@@ -498,8 +498,8 @@ here is an independent implementation - no rustpush code was copied.
 
 ## Writing (RecordSave / RecordDelete)
 
-`icp edit` (`icp/keychain/write.py`, transport in `transport/ckks.py` + `cloudkit.py`) changes an
-existing login in the `Passwords`/`Manatee` CKKS zones. Same CKDatabase endpoint family and
+`icp edit` / `icp add` (`icp/keychain/write.py`, transport in `transport/ckks.py` + `cloudkit.py`)
+change an existing login or create a new one in the `Passwords`/`Manatee` CKKS zones. Same CKDatabase endpoint family and
 `com.apple.securityd` bundle as the record fetch:
 
 - **Save**: `POST /ckdatabase/api/client/record/save`, operation type **210**, request in
@@ -535,6 +535,21 @@ Item encryption is the inverse of Stage 5:
 - Metadata sidecar payload: `s_as` = `[{"s": "<host>"}]`; `notes`/`title` keep their stored type
   (bytes). A written `totp` block uses `algorithm 0` (SHA1, the only value observed) and
   `_initialDate` 1970 as the Passwords app leaves it.
+
+**Creating a login** (`icp add`, `write.create`). There is no template-free encoder: the new
+login is inserted next to a real login of the same account in the `Passwords` zone (current class
+key, no `pcs*` fields), copying that record's layout under a new uppercase UUID, with `gen` reset
+to 0 (CKKS starts the generation count of a new item at 0) and `server_*` at 0. The item plist
+takes the template's attribute *set*, not its values: identity and value attributes are set
+(`class inet`, `agrp`, `srvr`, `acct`, `labl "<srvr> (<acct>)"`, `v_Data` as bytes, `ptcl htps`
+or `http` from the input URL, `cdat`/`mdat` now, `tomb 0`, `sync` true, `UUID` = record name);
+`pdmn`, `atyp`, `musr`, `vwht` are copied (`pdmn` has to match the template's class key);
+`port`, `path`, `sdmn`, `desc`, `icmt`, `alis`, `crtr`, `type`, `cusi`, `invi`, `nega`, `scrp`
+start at the empty value of their type; `sha1` and anything unknown (e.g. the sidecar's `bin0`)
+are left out. The sidecar is built the same way from an existing sidecar, payload
+`{title, notes (bytes), s_as: [], totp?}`, and only when a title, notes or 2FA code is given.
+Because a device keeps one item per primary key, `add` refuses a website + username that
+already has a login (or orphaned metadata).
 
 **Primary-key reconcile.** Website (`srvr`) and username (`acct`) are part of an `inet` item's
 primary key. A device applies an incoming modify by primary key only
