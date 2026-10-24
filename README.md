@@ -64,7 +64,7 @@ icp show
 ```
 
 Opens a full-screen list - start typing to filter, **Enter** to reveal a password,
-**Esc** to quit. Add a word to search directly, or `--plain` for plain text:
+**Ctrl+P** / **Ctrl+U** to copy the password / username to the clipboard, **Esc** to quit. Add a word to search directly, or `--plain` for plain text:
 
 ```
 icp show github
