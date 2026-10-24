@@ -22,7 +22,10 @@ from ..auth.anisette import Anisette, AnisetteError
 from ..auth.device import Device
 from ..auth.gsa import GSAClient, GSAError
 from ..auth.session import SessionError
+from ..octagon import client as octagon
+from ..octagon.client import OctagonError
 from ..totp import generate as totp_generate
+from ..transport.cloudkit import CloudKitError
 
 ICLOUD_AUTH_TOKEN = "com.apple.gs.icloud.auth"
 
@@ -281,7 +284,6 @@ def _status_summary() -> str:
     s = session.load()
     if not s:
         return "not signed in - run: icp login"
-    from ..octagon import client as octagon
     joined = "joined" if octagon.is_joined(s) else "not joined"
     token = ""
     icloud_auth = (s.get("app_tokens") or {}).get(ICLOUD_AUTH_TOKEN) or {}
@@ -521,10 +523,6 @@ def _join_and_sync(s: dict, device, anisette, username: str, password: str) -> i
     prompt that defaults to No. The given password (entered during sign-in) is reused for
     the escrow re-authentication, so it is never prompted twice.
     """
-    from ..octagon import client as octagon
-    from ..octagon.client import OctagonError
-    from ..transport.cloudkit import CloudKitError
-
     # Already a trusted keychain peer (e.g. a token-refresh re-login)? Octagon membership is
     # permanent, so skip the irreversible escrow join and just sync. Gate on is_joined, not a bare
     # peer_id: aborting bottle selection persists peer_id without ever joining.
@@ -534,6 +532,7 @@ def _join_and_sync(s: dict, device, anisette, username: str, password: str) -> i
             client = octagon.OctagonClient(s, device, anisette)
             session.save(s)
             n = client.sync_and_decrypt()
+            session.save(s)
         except (OctagonError, CloudKitError) as e:
             ui.err(f"sync failed: {e}")
             return 1
@@ -600,6 +599,7 @@ def _join_and_sync(s: dict, device, anisette, username: str, password: str) -> i
 
     try:
         n = client.sync_and_decrypt()
+        session.save(s)
     except CloudKitError as e:
         ui.err(f"joined, but sync failed: {e}")
         return 1
@@ -613,9 +613,6 @@ def cmd_sync(args) -> int:
     Guarded by a non-blocking file lock so the periodic background trigger and a manual run
     can never overlap (a second sync exits immediately rather than racing on the vault)."""
     import fcntl
-    from ..octagon import client as octagon
-    from ..octagon.client import OctagonError
-    from ..transport.cloudkit import CloudKitError
     from ..paths import sync_lock_file
 
     lock = open(sync_lock_file(), "w")
@@ -648,6 +645,7 @@ def cmd_sync(args) -> int:
             client = octagon.OctagonClient(s, device, anisette)
             session.save(s)  # persist the refreshed cloudKitToken + cloudKitUserId from ckAppInit
             n = client.sync_and_decrypt()
+            session.save(s)
         except (OctagonError, CloudKitError) as e:
             ui.err(f"sync failed: {e}")
             return 1
@@ -662,6 +660,44 @@ def cmd_sync(args) -> int:
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+
+
+def cmd_diag(args) -> int:
+    """Run read-only diagnostics."""
+    what = getattr(args, "what", "zones")
+    s = session.load()
+    if not s:
+        ui.err("not signed in - run: icp login")
+        return 1
+    device = Device.load_or_create()
+    anisette = Anisette(args.anisette)
+    try:
+        _ensure_fresh_tokens(s, device, anisette, interactive=sys.stdin.isatty())
+        session.save(s)
+        if what == "sharing":
+            diag.sharing_report(s, device, anisette, ui.out)
+            return 0
+        if what == "container":
+            if not getattr(args, "container", None):
+                ui.err("`diag container` needs --container <id> (and usually --bundle <id>)")
+                return 1
+            diag.sharing_report(s, device, anisette, ui.out,
+                                container=args.container, bundle=getattr(args, "bundle", None))
+            return 0
+        if not (s.get("octagon") or {}).get("peer_id"):
+            ui.err("not joined to the keychain - run: icp login")
+            return 1
+        client = octagon.OctagonClient(s, device, anisette)
+        session.save(s)
+        if what == "groups":
+            diag.groups_report(client, ui.out)
+            session.save(s)  # Persist kcsharingUserId.
+        else:
+            diag.zone_report(client, ui.out)
+    except (icloud.ICloudError, AnisetteError, GSAError, OctagonError, CloudKitError) as e:
+        ui.err(f"diag failed: {e}")
+        return 1
+    return 0
 
 
 def _ensure_web_session(s: dict, *, interactive: bool):
@@ -750,6 +786,17 @@ def main(argv=None) -> int:
 
     sub.add_parser("sync", help="re-fetch and decrypt the keychain into the vault"
                    ).set_defaults(func=cmd_sync)
+
+    dp = sub.add_parser(
+        "diag", help="read-only diagnostics (may print group names and opaque CloudKit IDs)")
+    dp.add_argument("what", choices=["zones", "sharing", "container", "groups"],
+                    help="zones: keychain CKKS zones this peer sees; "
+                         "groups: group names and decrypted record counts; "
+                         "sharing: zone/owner IDs and record counts; "
+                         "container: probe an arbitrary container (needs --container)")
+    dp.add_argument("--container", help="container id for `diag container`")
+    dp.add_argument("--bundle", help="bundle id to use for `diag container`")
+    dp.set_defaults(func=cmd_diag)
 
     op = sub.add_parser("logout", help="clear the stored session")
     op.add_argument("--wipe-device", action="store_true", help="also remove the device identity")
